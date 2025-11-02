@@ -16,7 +16,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS - Same beautiful centered design
+# Custom CSS
 st.markdown("""
 <style>
     #MainMenu {visibility: hidden;}
@@ -320,29 +320,39 @@ def calculate_strategy_returns(sentiment_df, top_n, start, end):
     unique_tickers = top_stocks['ticker'].unique().tolist()
     
     try:
-        # Download price data
-        raw_prices = yf.download(unique_tickers, start=start, end=end, progress=False)
+        # Download price data with auto_adjust to get simpler format
+        raw_prices = yf.download(unique_tickers, start=start, end=end, progress=False, auto_adjust=True)
         
         # Handle different yfinance return formats
+        if len(raw_prices) == 0:
+            st.warning("⚠️ No price data available for the selected period")
+            return None, None, None
+            
         if isinstance(raw_prices, pd.Series):
             prices = raw_prices.to_frame(name=unique_tickers[0])
         elif isinstance(raw_prices.columns, pd.MultiIndex):
-            # MultiIndex columns - extract 'Adj Close'
-            if 'Adj Close' in raw_prices.columns.get_level_values(0):
-                prices = raw_prices['Adj Close']
-            else:
+            # MultiIndex columns - extract 'Close' (auto_adjust=True uses Close)
+            try:
                 prices = raw_prices['Close']
+            except KeyError:
+                # Fallback: get first level values
+                prices = raw_prices.xs('Close', axis=1, level=0)
         else:
-            # Single level columns
-            prices = raw_prices
+            # Single level columns - assume it's already the right format
+            if 'Close' in raw_prices.columns:
+                prices = raw_prices[['Close']]
+                prices.columns = [unique_tickers[0]]
+            else:
+                prices = raw_prices
         
         # Ensure it's a DataFrame
         if isinstance(prices, pd.Series):
             prices = prices.to_frame(name=unique_tickers[0])
         
-        # Handle single ticker case
-        if len(unique_tickers) == 1 and len(prices.columns) == 1:
-            prices.columns = [unique_tickers[0]]
+        # Handle single ticker case - rename column properly
+        if len(unique_tickers) == 1:
+            if len(prices.columns) == 1:
+                prices.columns = [unique_tickers[0]]
         
         # Ensure all tickers we need are available in prices
         available_tickers = [t for t in unique_tickers if t in prices.columns]
@@ -450,10 +460,29 @@ if 'run' in st.session_state and st.session_state.run:
         status_text.markdown("### 📈 Downloading benchmark...")
         progress_bar.progress(80)
         
-        benchmark = yf.download("QQQ", start=start_date, end=end_date, progress=False)['Adj Close']
-        if len(benchmark) == 0:
+        # Download benchmark with auto_adjust for simpler format
+        benchmark_raw = yf.download("QQQ", start=start_date, end=end_date, progress=False, auto_adjust=True)
+        
+        if len(benchmark_raw) == 0:
             st.error("❌ Unable to download benchmark data")
             st.stop()
+        
+        # Handle MultiIndex or regular DataFrame
+        if isinstance(benchmark_raw.columns, pd.MultiIndex):
+            try:
+                benchmark = benchmark_raw['Close']
+            except KeyError:
+                benchmark = benchmark_raw.xs('Close', axis=1, level=0)
+        elif 'Close' in benchmark_raw.columns:
+            benchmark = benchmark_raw['Close']
+        else:
+            # Take first column if structure is unexpected
+            benchmark = benchmark_raw.iloc[:, 0]
+        
+        # Handle Series or DataFrame
+        if isinstance(benchmark, pd.DataFrame):
+            benchmark = benchmark.iloc[:, 0]
+        
         benchmark = benchmark / benchmark.iloc[0]
         
         progress_bar.progress(100)
@@ -461,6 +490,27 @@ if 'run' in st.session_state and st.session_state.run:
         progress_bar.empty()
         
         st.success("🎉 Strategy Analysis Complete!")
+        
+        # Summary Box
+        st.markdown("""
+        <div class='info-box'>
+            <h3>📋 Strategy Summary</h3>
+            <p style='font-size: 1.05rem; line-height: 1.8; margin: 0;'>
+                <strong>Period:</strong> {} to {}<br>
+                <strong>Portfolio Size:</strong> Top {} stocks by sentiment<br>
+                <strong>Rebalancing:</strong> {}<br>
+                <strong>Data Points:</strong> {:,} sentiment records analyzed<br>
+                <strong>Stocks Tracked:</strong> {} unique tickers
+            </p>
+        </div>
+        """.format(
+            start_date.strftime('%B %d, %Y'),
+            end_date.strftime('%B %d, %Y'),
+            top_n,
+            rebalance,
+            len(twitter_data),
+            len(twitter_data['ticker'].unique())
+        ), unsafe_allow_html=True)
         
         # RESULTS
         st.markdown('<p class="section-title">📊 Performance Overview</p>', unsafe_allow_html=True)
@@ -488,53 +538,344 @@ if 'run' in st.session_state and st.session_state.run:
         with col5:
             st.metric("Volatility", f"{strategy_metrics['ann_vol']:.2f}%")
         
+        # Key Insights
+        st.markdown('<p class="section-title">💡 Key Insights</p>', unsafe_allow_html=True)
+        
+        outperformance = strategy_metrics['total_return'] - benchmark_metrics['total_return']
+        sharpe_diff = strategy_metrics['sharpe'] - benchmark_metrics['sharpe']
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            perf_emoji = "🎯" if outperformance > 0 else "📉"
+            perf_color = "#1DA1F2" if outperformance > 0 else "#E1E8ED"
+            st.markdown(f"""
+            <div style='background: {perf_color}; padding: 1.5rem; border-radius: 15px; text-align: center;'>
+                <h3 style='color: white; margin: 0; font-size: 2.5rem;'>{perf_emoji}</h3>
+                <p style='color: white; margin: 0.5rem 0 0 0; font-size: 1.1rem; font-weight: 600;'>
+                    {'Outperformed' if outperformance > 0 else 'Underperformed'} QQQ by {abs(outperformance):.2f}%
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            risk_emoji = "✅" if strategy_metrics['sharpe'] > 1.0 else "⚠️"
+            st.markdown(f"""
+            <div style='background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 15px; text-align: center;'>
+                <h3 style='color: white; margin: 0; font-size: 2.5rem;'>{risk_emoji}</h3>
+                <p style='color: white; margin: 0.5rem 0 0 0; font-size: 1.1rem; font-weight: 600;'>
+                    Sharpe Ratio: {strategy_metrics['sharpe']:.2f} ({'Excellent' if strategy_metrics['sharpe'] > 1.5 else 'Good' if strategy_metrics['sharpe'] > 1.0 else 'Moderate'})
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            win_emoji = "🏆" if strategy_metrics['win_rate'] > 55 else "📊"
+            winning_days = int(strategy_metrics['win_rate'] * len(portfolio_series.pct_change().dropna()) / 100)
+            st.markdown(f"""
+            <div style='background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); padding: 1.5rem; border-radius: 15px; text-align: center;'>
+                <h3 style='color: white; margin: 0; font-size: 2.5rem;'>{win_emoji}</h3>
+                <p style='color: white; margin: 0.5rem 0 0 0; font-size: 1.1rem; font-weight: 600;'>
+                    Win Rate: {strategy_metrics['win_rate']:.1f}% ({winning_days} winning days)
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+        
         # Performance Chart
         st.markdown('<p class="section-title">💹 Cumulative Returns</p>', unsafe_allow_html=True)
         
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=portfolio_series.index, y=(portfolio_series - 1) * 100,
-                                name='Twitter Strategy', line=dict(color='#1DA1F2', width=3), fill='tonexty'))
-        fig.add_trace(go.Scatter(x=benchmark.index, y=(benchmark - 1) * 100,
-                                name='QQQ Benchmark', line=dict(color='#657786', width=3, dash='dash')))
-        fig.update_layout(height=550, xaxis_title='Date', yaxis_title='Return (%)',
-                         hovermode='x unified', plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+        fig.add_trace(go.Scatter(
+            x=portfolio_series.index, 
+            y=(portfolio_series - 1) * 100,
+            name='Twitter Strategy', 
+            line=dict(color='#1DA1F2', width=3),
+            fill='tozeroy',
+            fillcolor='rgba(29, 161, 242, 0.1)'
+        ))
+        fig.add_trace(go.Scatter(
+            x=benchmark.index, 
+            y=(benchmark - 1) * 100,
+            name='QQQ Benchmark', 
+            line=dict(color='#657786', width=3, dash='dash')
+        ))
+        fig.update_layout(
+            height=500, 
+            xaxis_title='Date', 
+            yaxis_title='Return (%)',
+            hovermode='x unified', 
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            font=dict(size=12),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            )
+        )
         st.plotly_chart(fig, use_container_width=True)
         
-        # Sentiment Analysis
+        # Detailed Analytics
+        st.markdown('<p class="section-title">📈 Detailed Performance Analytics</p>', unsafe_allow_html=True)
+        
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("### 📊 Top Sentiments")
-            avg_sentiment = twitter_data.groupby('ticker')['sentiment'].mean().sort_values(ascending=False).head(15)
+            st.markdown("### 📊 Monthly Returns Distribution")
+            monthly_returns = portfolio_series.resample('M').last().pct_change().dropna() * 100
             fig = go.Figure()
-            colors = ['#1DA1F2' if x > 0 else '#E1E8ED' for x in avg_sentiment.values]
-            fig.add_trace(go.Bar(x=avg_sentiment.index, y=avg_sentiment.values, marker=dict(color=colors)))
-            fig.update_layout(height=400, plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+            colors = ['#1DA1F2' if x > 0 else '#E1E8ED' for x in monthly_returns.values]
+            fig.add_trace(go.Bar(
+                x=monthly_returns.index.strftime('%Y-%m'),
+                y=monthly_returns.values,
+                marker=dict(color=colors),
+                name='Monthly Returns'
+            ))
+            fig.update_layout(
+                height=350,
+                xaxis_title='Month',
+                yaxis_title='Return (%)',
+                plot_bgcolor='white',
+                paper_bgcolor='white',
+                showlegend=False
+            )
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            st.markdown("### 📋 Current Holdings")
+            st.markdown("### 📉 Drawdown Analysis")
+            cumulative = portfolio_series
+            running_max = cumulative.cummax()
+            drawdown = (cumulative - running_max) / running_max * 100
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=drawdown.index,
+                y=drawdown.values,
+                fill='tozeroy',
+                line=dict(color='#E1E8ED', width=2),
+                fillcolor='rgba(225, 232, 237, 0.5)',
+                name='Drawdown'
+            ))
+            fig.update_layout(
+                height=350,
+                xaxis_title='Date',
+                yaxis_title='Drawdown (%)',
+                plot_bgcolor='white',
+                paper_bgcolor='white',
+                showlegend=False
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Sentiment Analysis
+        st.markdown('<p class="section-title">🐦 Sentiment Analysis</p>', unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### 📊 Top Sentiments by Stock")
+            avg_sentiment = twitter_data.groupby('ticker')['sentiment'].mean().sort_values(ascending=False).head(15)
+            fig = go.Figure()
+            colors = ['#1DA1F2' if x > 0 else '#E1E8ED' for x in avg_sentiment.values]
+            fig.add_trace(go.Bar(
+                x=avg_sentiment.index,
+                y=avg_sentiment.values,
+                marker=dict(color=colors),
+                text=[f'{x:.3f}' for x in avg_sentiment.values],
+                textposition='outside'
+            ))
+            fig.update_layout(
+                height=400,
+                xaxis_title='Ticker',
+                yaxis_title='Average Sentiment',
+                plot_bgcolor='white',
+                paper_bgcolor='white',
+                showlegend=False
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            st.markdown("### 📋 Current Portfolio Holdings")
             if holdings:
                 latest_holdings = holdings[-1]
                 latest_sentiment = processed_data[processed_data['date'] == latest_holdings['date']]
                 latest_sentiment = latest_sentiment[latest_sentiment['ticker'].isin(latest_holdings['stocks'])]
                 display_df = latest_sentiment[['ticker', 'sentiment', 'volume', 'rank']].sort_values('rank')
                 display_df.columns = ['Ticker', 'Sentiment', 'Volume', 'Rank']
-                st.dataframe(display_df.style.background_gradient(cmap='RdYlGn', subset=['Sentiment']),
-                           use_container_width=True, height=400)
+                display_df['Sentiment'] = display_df['Sentiment'].round(3)
+                st.dataframe(
+                    display_df.style.background_gradient(cmap='RdYlGn', subset=['Sentiment']),
+                    use_container_width=True,
+                    height=400
+                )
         
-        # Download
-        st.markdown("### 📥 Download Results")
-        col1, col2 = st.columns(2)
+        # Statistics Table
+        st.markdown('<p class="section-title">📊 Performance Statistics Comparison</p>', unsafe_allow_html=True)
+        
+        stats_df = pd.DataFrame({
+            'Metric': ['Total Return (%)', 'Annualized Return (%)', 'Annualized Volatility (%)', 
+                       'Sharpe Ratio', 'Max Drawdown (%)', 'Win Rate (%)'],
+            'Twitter Strategy': [
+                f"{strategy_metrics['total_return']:.2f}",
+                f"{strategy_metrics['ann_return']:.2f}",
+                f"{strategy_metrics['ann_vol']:.2f}",
+                f"{strategy_metrics['sharpe']:.3f}",
+                f"{strategy_metrics['max_dd']:.2f}",
+                f"{strategy_metrics['win_rate']:.2f}"
+            ],
+            'QQQ Benchmark': [
+                f"{benchmark_metrics['total_return']:.2f}",
+                f"{benchmark_metrics['ann_return']:.2f}",
+                f"{benchmark_metrics['ann_vol']:.2f}",
+                f"{benchmark_metrics['sharpe']:.3f}",
+                f"{benchmark_metrics['max_dd']:.2f}",
+                f"{benchmark_metrics['win_rate']:.2f}"
+            ],
+            'Difference': [
+                f"{strategy_metrics['total_return'] - benchmark_metrics['total_return']:.2f}",
+                f"{strategy_metrics['ann_return'] - benchmark_metrics['ann_return']:.2f}",
+                f"{strategy_metrics['ann_vol'] - benchmark_metrics['ann_vol']:.2f}",
+                f"{strategy_metrics['sharpe'] - benchmark_metrics['sharpe']:.3f}",
+                f"{strategy_metrics['max_dd'] - benchmark_metrics['max_dd']:.2f}",
+                f"{strategy_metrics['win_rate'] - benchmark_metrics['win_rate']:.2f}"
+            ]
+        })
+        
+        st.dataframe(stats_df, use_container_width=True, hide_index=True)
+        
+        # Portfolio Composition Over Time
+        st.markdown('<p class="section-title">💼 Portfolio Composition Over Time</p>', unsafe_allow_html=True)
+        
+        if holdings and len(holdings) > 1:
+            # Create portfolio evolution visualization
+            holding_dates = [h['date'] for h in holdings[-12:]]  # Last 12 rebalances
+            holding_stocks = [', '.join(h['stocks'][:5]) + ('...' if len(h['stocks']) > 5 else '') for h in holdings[-12:]]
+            
+            st.markdown("### 🔄 Recent Portfolio Rebalancing History")
+            
+            rebalance_df = pd.DataFrame({
+                'Date': [d.strftime('%Y-%m-%d') for d in holding_dates],
+                'Top Holdings': holding_stocks,
+                'Portfolio Size': [len(h['stocks']) for h in holdings[-12:]]
+            })
+            
+            st.dataframe(rebalance_df, use_container_width=True, hide_index=True)
+        
+        # Sentiment Trend Over Time
+        st.markdown('<p class="section-title">📈 Sentiment Trends</p>', unsafe_allow_html=True)
+        
+        sentiment_over_time = twitter_data.groupby(pd.Grouper(key='date', freq='M'))['sentiment'].mean()
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=sentiment_over_time.index,
+            y=sentiment_over_time.values,
+            mode='lines+markers',
+            line=dict(color='#1DA1F2', width=3),
+            marker=dict(size=8),
+            fill='tozeroy',
+            fillcolor='rgba(29, 161, 242, 0.1)',
+            name='Average Sentiment'
+        ))
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+        fig.update_layout(
+            height=350,
+            xaxis_title='Date',
+            yaxis_title='Average Sentiment Score',
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            hovermode='x unified'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Risk-Return Scatter
+        st.markdown('<p class="section-title">⚖️ Risk-Return Profile</p>', unsafe_allow_html=True)
+        
+        col1, col2 = st.columns([2, 1])
+        
         with col1:
-            results_csv = pd.DataFrame({
-                'Date': portfolio_series.index,
-                'Strategy Return': (portfolio_series - 1) * 100
-            }).to_csv(index=False)
-            st.download_button("📈 Download Returns CSV", results_csv, "returns.csv", "text/csv")
+            fig = go.Figure()
+            
+            # Add strategy point
+            fig.add_trace(go.Scatter(
+                x=[strategy_metrics['ann_vol']],
+                y=[strategy_metrics['ann_return']],
+                mode='markers+text',
+                marker=dict(size=20, color='#1DA1F2'),
+                text=['Twitter Strategy'],
+                textposition='top center',
+                textfont=dict(size=12, color='#1DA1F2'),
+                name='Twitter Strategy'
+            ))
+            
+            # Add benchmark point
+            fig.add_trace(go.Scatter(
+                x=[benchmark_metrics['ann_vol']],
+                y=[benchmark_metrics['ann_return']],
+                mode='markers+text',
+                marker=dict(size=20, color='#657786'),
+                text=['QQQ Benchmark'],
+                textposition='bottom center',
+                textfont=dict(size=12, color='#657786'),
+                name='QQQ Benchmark'
+            ))
+            
+            fig.update_layout(
+                height=400,
+                xaxis_title='Annualized Volatility (%)',
+                yaxis_title='Annualized Return (%)',
+                plot_bgcolor='white',
+                paper_bgcolor='white',
+                showlegend=False
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
         with col2:
-            sentiment_csv = twitter_data.to_csv(index=False)
-            st.download_button("💾 Download Sentiment Data", sentiment_csv, "sentiment.csv", "text/csv")
+            st.markdown("### 🎯 Strategy Highlights")
+            st.markdown(f"""
+            **Returns**
+            - Total: {strategy_metrics['total_return']:.2f}%
+            - Annualized: {strategy_metrics['ann_return']:.2f}%
+            
+            **Risk Metrics**
+            - Volatility: {strategy_metrics['ann_vol']:.2f}%
+            - Max DD: {strategy_metrics['max_dd']:.2f}%
+            
+            **Performance**
+            - Sharpe: {strategy_metrics['sharpe']:.3f}
+            - Win Rate: {strategy_metrics['win_rate']:.1f}%
+            
+            **vs Benchmark**
+            - Alpha: {outperformance:.2f}%
+            - Better Sharpe: {sharpe_diff > 0}
+            """)
+        
+        # Final Summary
+        st.markdown('<p class="section-title">✨ Executive Summary</p>', unsafe_allow_html=True)
+        
+        summary_color = "#1DA1F2" if outperformance > 0 else "#657786"
+        summary_emoji = "🚀" if outperformance > 0 else "📊"
+        
+        st.markdown(f"""
+        <div style='background: {summary_color}; padding: 2rem; border-radius: 20px; color: white;'>
+            <h3 style='margin: 0 0 1rem 0; font-size: 2rem;'>{summary_emoji} Strategy Performance Summary</h3>
+            <p style='font-size: 1.1rem; line-height: 1.8; margin: 0;'>
+                The Twitter Sentiment Trading Strategy {'<strong>outperformed</strong>' if outperformance > 0 else '<strong>underperformed</strong>'} 
+                the QQQ benchmark by <strong>{abs(outperformance):.2f}%</strong> over the {(end_date - start_date).days} day period 
+                from {start_date.strftime('%B %Y')} to {end_date.strftime('%B %Y')}.
+                <br><br>
+                The strategy achieved a total return of <strong>{strategy_metrics['total_return']:.2f}%</strong> with a Sharpe ratio 
+                of <strong>{strategy_metrics['sharpe']:.3f}</strong>, demonstrating {'excellent' if strategy_metrics['sharpe'] > 1.5 else 'good' if strategy_metrics['sharpe'] > 1.0 else 'moderate'} 
+                risk-adjusted returns. The portfolio maintained a win rate of <strong>{strategy_metrics['win_rate']:.1f}%</strong> 
+                while tracking {len(twitter_data['ticker'].unique())} stocks based on {len(twitter_data):,} sentiment data points.
+                <br><br>
+                Maximum drawdown was <strong>{strategy_metrics['max_dd']:.2f}%</strong>, showing 
+                {'better' if strategy_metrics['max_dd'] > benchmark_metrics['max_dd'] else 'worse'} downside protection compared 
+                to the benchmark's {benchmark_metrics['max_dd']:.2f}% drawdown.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
         
     except Exception as e:
         st.error(f"❌ Error: {str(e)}")
@@ -547,7 +888,7 @@ else:
     <div class='info-box'>
         <h3>🚀 Ready to Start?</h3>
         <p style='font-size: 1.1rem; margin-bottom: 0;'>
-            Configure your strategy above and click <b>"RUN STRATEGY NOW"</b>!
+            Configure your strategy above and click <b>"RUN STRATEGY NOW"</b> to see comprehensive analytics!
         </p>
     </div>
     """, unsafe_allow_html=True)
