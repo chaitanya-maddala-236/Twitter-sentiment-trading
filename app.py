@@ -320,13 +320,28 @@ def calculate_strategy_returns(sentiment_df, top_n, start, end):
     unique_tickers = top_stocks['ticker'].unique().tolist()
     
     try:
-        prices = yf.download(unique_tickers, start=start, end=end, progress=False)['Adj Close']
+        # Download price data
+        raw_prices = yf.download(unique_tickers, start=start, end=end, progress=False)
         
+        # Handle different yfinance return formats
+        if isinstance(raw_prices, pd.Series):
+            prices = raw_prices.to_frame(name=unique_tickers[0])
+        elif isinstance(raw_prices.columns, pd.MultiIndex):
+            # MultiIndex columns - extract 'Adj Close'
+            if 'Adj Close' in raw_prices.columns.get_level_values(0):
+                prices = raw_prices['Adj Close']
+            else:
+                prices = raw_prices['Close']
+        else:
+            # Single level columns
+            prices = raw_prices
+        
+        # Ensure it's a DataFrame
         if isinstance(prices, pd.Series):
             prices = prices.to_frame(name=unique_tickers[0])
         
-        # Handle both single and multiple ticker downloads
-        if len(unique_tickers) == 1:
+        # Handle single ticker case
+        if len(unique_tickers) == 1 and len(prices.columns) == 1:
             prices.columns = [unique_tickers[0]]
         
         # Ensure all tickers we need are available in prices
